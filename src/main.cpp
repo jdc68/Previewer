@@ -163,7 +163,7 @@ static void Log(const wchar_t* fmt, ...)
 // File types
 // ---------------------------------------------------------------------------------------------
 
-enum class Kind { None, Image, Video, Audio };
+enum class Kind { None, Image, Video, Audio, Text };
 
 static const wchar_t* const kImageExt[] = {
     L"jpg", L"jpeg", L"jpe", L"jfif", L"png", L"gif", L"bmp", L"dib", L"tif", L"tiff", L"ico", L"webp",
@@ -175,6 +175,15 @@ static const wchar_t* const kVideoExt[] = {
 static const wchar_t* const kAudioExt[] = {
     L"mp3", L"wav", L"wma", L"m4a", L"aac", L"flac", L"ogg", L"oga", L"opus", L"aif", L"aiff", L"amr",
     L"ac3", L"mka" };
+static const wchar_t* const kTextExt[] = {
+    L"txt", L"text", L"log", L"md", L"markdown", L"rst", L"csv", L"tsv", L"json", L"jsonc", L"xml", L"xaml",
+    L"yaml", L"yml", L"toml", L"ini", L"cfg", L"conf", L"config", L"properties", L"env", L"reg", L"inf",
+    L"nfo", L"srt", L"vtt", L"sub", L"tex", L"html", L"htm", L"css", L"scss", L"less", L"svg",
+    L"c", L"h", L"cpp", L"cc", L"cxx", L"hpp", L"hxx", L"cs", L"java", L"kt", L"kts", L"scala", L"go",
+    L"rs", L"swift", L"m", L"mm", L"js", L"mjs", L"cjs", L"jsx", L"tsx", L"vue", L"py", L"pyw", L"rb",
+    L"php", L"pl", L"lua", L"r", L"dart", L"sql", L"sh", L"bash", L"zsh", L"bat", L"cmd", L"ps1", L"psm1",
+    L"psd1", L"vbs", L"gradle", L"cmake", L"mk", L"rc", L"manifest", L"csproj", L"vcxproj", L"sln",
+    L"gitignore", L"gitattributes", L"editorconfig", L"diff", L"patch" };
 
 static const wchar_t* ExtOf(const std::wstring& p)
 {
@@ -189,10 +198,11 @@ static Kind KindOf(const std::wstring& p)
 {
     const wchar_t* e = ExtOf(p);
     if (!e)
-        return Kind::None;
+        return Kind::Text;   // README, LICENSE, Makefile...; binary files are rejected when loading
     for (auto x : kImageExt) if (_wcsicmp(e, x) == 0) return Kind::Image;
     for (auto x : kVideoExt) if (_wcsicmp(e, x) == 0) return Kind::Video;
     for (auto x : kAudioExt) if (_wcsicmp(e, x) == 0) return Kind::Audio;
+    for (auto x : kTextExt) if (_wcsicmp(e, x) == 0) return Kind::Text;
     return Kind::None;
 }
 
@@ -222,6 +232,10 @@ struct Preview {
     HBITMAP cover = nullptr;       // album art for audio
     SIZE coverSize{};
     DWORD ownerPid = 0;            // Explorer process that owns the hovered window
+    std::wstring text;             // beginning of a text file
+    const wchar_t* encoding = L"";
+    int lines = 0;                 // total line count, 0 if only part of the file was read
+    bool textTruncated = false;
 
     ~Preview()
     {
@@ -271,6 +285,116 @@ static void FlattenAlpha(UINT32* px, int w, int h, int cell)
             c = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
+}
+
+// Reads the start of a text file. Returns false for binary files.
+static bool LoadText(Preview* p)
+{
+    const size_t kReadBytes = 64 * 1024, kMaxChars = 8000;
+    const int kMaxLines = 200;
+    HANDLE f = CreateFileW(p->path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return false;
+    std::vector<BYTE> b(kReadBytes);
+    DWORD n = 0;
+    BOOL ok = ReadFile(f, b.data(), (DWORD)b.size(), &n, nullptr);
+    CloseHandle(f);
+    if (!ok)
+        return false;
+    b.resize(n);
+    bool partial = p->fileSize > n;
+
+    std::wstring t;
+    auto fromUtf16 = [&](size_t start, bool bigEndian) {
+        size_t count = (b.size() - start) / 2;
+        t.resize(count);
+        for (size_t i = 0; i < count; i++) {
+            BYTE lo = b[start + i * 2], hi = b[start + i * 2 + 1];
+            t[i] = bigEndian ? (wchar_t)((lo << 8) | hi) : (wchar_t)((hi << 8) | lo);
+        }
+    };
+    auto convert = [&](UINT cp, size_t start, DWORD flags) {
+        // The read may have cut a multi-byte character in half: retry a few bytes shorter.
+        for (size_t cut = 0; cut <= 3 && b.size() >= start + cut; cut++) {
+            int len = (int)(b.size() - start - cut);
+            if (len == 0) { t.clear(); return true; }
+            int wn = MultiByteToWideChar(cp, flags, (const char*)b.data() + start, len, nullptr, 0);
+            if (wn > 0) {
+                t.resize(wn);
+                MultiByteToWideChar(cp, flags, (const char*)b.data() + start, len, &t[0], wn);
+                return true;
+            }
+            if (!partial) break;
+        }
+        return false;
+    };
+
+    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+        convert(CP_UTF8, 3, 0);
+        p->encoding = L"UTF-8";
+    } else if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+        fromUtf16(2, false);
+        p->encoding = L"UTF-16";
+    } else if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+        fromUtf16(2, true);
+        p->encoding = L"UTF-16 BE";
+    } else {
+        size_t zeros = 0, oddZeros = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!b[i]) { zeros++; if (i & 1) oddZeros++; }
+        if (zeros) {
+            if (oddZeros * 10 < n * 4 || oddZeros < zeros * 9 / 10)
+                return false;   // NUL bytes that don't look like UTF-16 text: binary
+            fromUtf16(0, false);
+            p->encoding = L"UTF-16";
+        } else if (convert(CP_UTF8, 0, MB_ERR_INVALID_CHARS)) {
+            bool ascii = std::all_of(b.begin(), b.end(), [](BYTE c) { return c < 0x80; });
+            p->encoding = ascii ? L"ASCII" : L"UTF-8";
+        } else {
+            convert(CP_ACP, 0, 0);
+            p->encoding = L"ANSI";
+        }
+    }
+
+    size_t controls = 0, probe = std::min<size_t>(t.size(), 4000);
+    for (size_t i = 0; i < probe; i++) {
+        wchar_t c = t[i];
+        if (c < 0x20 && c != L'\t' && c != L'\n' && c != L'\r' && c != L'\f')
+            controls++;
+    }
+    if (controls * 50 > probe + 1)
+        return false;
+
+    int lines = 0;
+    size_t end = t.size();
+    for (size_t i = 0; i < t.size(); i++) {
+        if (t[i] == L'\n' && ++lines >= kMaxLines) { end = i; break; }
+        if (i >= kMaxChars) { end = i; break; }
+    }
+    bool cut = end < t.size();
+    t.resize(end);
+    if (!cut && !partial)
+        p->lines = lines + ((t.empty() || t.back() == L'\n') ? 0 : 1);
+    p->textTruncated = cut || partial;
+    if (t.empty())
+        p->encoding = L"";
+    p->text = std::move(t);
+    return true;
+}
+
+// ".ts" is both an MPEG transport stream and a TypeScript file: look at the bytes.
+static bool LooksLikeMpegTs(const std::wstring& path)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return true;
+    BYTE b[189] = {};
+    DWORD n = 0;
+    ReadFile(f, b, sizeof(b), &n, nullptr);
+    CloseHandle(f);
+    return n == sizeof(b) && b[0] == 0x47 && b[188] == 0x47;
 }
 
 static std::wstring FormatSize(ULONGLONG b)
@@ -853,6 +977,14 @@ Preview* Detector::Create(const std::wstring& path, POINT pt)
     Kind k = KindOf(path);
     if (k == Kind::None)
         return nullptr;
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad) ||
+        (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return nullptr;
+    const wchar_t* ext = ExtOf(path);
+    if (k == Kind::Video && ext && _wcsicmp(ext, L"ts") == 0 && !LooksLikeMpegTs(path))
+        k = Kind::Text;
+
     Preview* p = new Preview;
     p->kind = k;
     p->path = path;
@@ -860,11 +992,15 @@ Preview* Detector::Create(const std::wstring& path, POINT pt)
     p->fileName = slash == std::wstring::npos ? path : path.substr(slash + 1);
     p->pt = pt;
     ComputeBox(p);
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
-        p->fileSize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    p->fileSize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
 
-    if (k == Kind::Image) {
+    if (k == Kind::Text) {
+        if (!LoadText(p)) {
+            Log(L"not a text file: %s", path.c_str());
+            delete p;
+            return nullptr;
+        }
+    } else if (k == Kind::Image) {
         if (!DecodeImage(p)) {
             SIZE sz{};
             HBITMAP b = ShellImage(path, std::max(p->box.cx, p->box.cy), true, &sz);
@@ -1035,7 +1171,10 @@ static UINT g_frame = 0;
 static LONGLONG g_duration = 0;
 static std::wstring g_error;
 static int g_fontDpi = 0;
-static HFONT g_fName = nullptr, g_fInfo = nullptr, g_fIcon = nullptr;
+static HFONT g_fName = nullptr, g_fInfo = nullptr, g_fIcon = nullptr, g_fMono = nullptr;
+static bool g_textWrap = false;
+static const COLORREF kTextBg = RGB(24, 24, 24);
+static const UINT kTextFlags = DT_EXPANDTABS | DT_TABSTOP | DT_NOPREFIX | DT_LEFT;
 
 static int S(int v) { return MulDiv(v, g_cur ? g_cur->dpi : 96, 96); }
 
@@ -1046,6 +1185,9 @@ static void EnsureFonts(int dpi)
     if (g_fName) DeleteObject(g_fName);
     if (g_fInfo) DeleteObject(g_fInfo);
     if (g_fIcon) DeleteObject(g_fIcon);
+    if (g_fMono) DeleteObject(g_fMono);
+    g_fMono = CreateFontW(-MulDiv(13, dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                          CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
     g_fName = CreateFontW(-MulDiv(13, dpi, 96), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                           CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_fInfo = CreateFontW(-MulDiv(12, dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
@@ -1262,6 +1404,31 @@ void PlayerCallback::OnMediaPlayerEvent(MFP_EVENT_HEADER* h)
     }
 }
 
+static RECT TextInset(RECT r) { return { r.left + S(12), r.top + S(10), r.right - S(12), r.bottom - S(10) }; }
+
+// Size the text area to the content: narrow for short lines, wrapped at the preview width otherwise.
+static SIZE MeasureText(const Preview* p)
+{
+    HDC dc = GetDC(g_popup);
+    HGDIOBJ old = SelectObject(dc, g_fMono);
+    DRAWTEXTPARAMS dtp{ sizeof(dtp), 4, 0, 0, 0 };
+    std::wstring t = p->text.empty() ? L"(empty file)" : p->text;
+    int padW = 2 * S(12), padH = 2 * S(10);
+    int maxW = std::max<int>(p->box.cx, S(280));
+    RECT r = { 0, 0, maxW - padW, 0 };
+    DrawTextExW(dc, &t[0], (int)t.size(), &r, kTextFlags | DT_CALCRECT, &dtp);
+    g_textWrap = r.right > maxW - padW;
+    if (g_textWrap) {
+        r = { 0, 0, maxW - padW, 0 };
+        DrawTextExW(dc, &t[0], (int)t.size(), &r, kTextFlags | DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL, &dtp);
+    }
+    SelectObject(dc, old);
+    ReleaseDC(g_popup, dc);
+    int w = std::clamp<int>(r.right + padW, S(280), maxW);
+    int h = std::clamp<int>(r.bottom + padH, S(40), std::max<int>(p->box.cy, S(40)));
+    return { w, h };
+}
+
 static void ShowPreview(Preview* p)
 {
     HidePreview();
@@ -1277,6 +1444,12 @@ static void ShowPreview(Preview* p)
         LayoutMedia();
         if (p->frames.size() > 1)
             SetTimer(g_popup, T_ANIM, p->delays[0], nullptr);
+        return;
+    }
+    if (p->kind == Kind::Text) {
+        g_content = MeasureText(p);
+        g_hasVideo = false;
+        LayoutMedia();
         return;
     }
 
@@ -1345,6 +1518,26 @@ static void PaintMedia(HDC dc, const RECT& rc)
     }
 
     std::wstring info;
+    if (g_cur->kind == Kind::Text) {
+        FillRectColor(dc, cr, kTextBg);
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, cr.left, cr.top, cr.right, cr.bottom);
+        SelectObject(dc, g_fMono);
+        bool empty = g_cur->text.empty();
+        SetTextColor(dc, empty ? kSub : RGB(222, 222, 222));
+        std::wstring t = empty ? L"(empty file)" : g_cur->text;
+        RECT tr = TextInset(cr);
+        DRAWTEXTPARAMS dtp{ sizeof(dtp), 4, 0, 0, 0 };
+        DrawTextExW(dc, &t[0], (int)t.size(), &tr, kTextFlags | (g_textWrap ? DT_WORDBREAK | DT_EDITCONTROL : 0),
+                    &dtp);
+        RestoreDC(dc, saved);
+        info = g_cur->encoding;
+        if (g_cur->lines > 0) {
+            wchar_t ln[48];
+            swprintf_s(ln, g_cur->lines == 1 ? L"%d line" : L"%d lines", g_cur->lines);
+            info += std::wstring(L"  ·  ") + ln;
+        }
+    }
     wchar_t dim[64];
     if (g_cur->src.cx > 0) {
         swprintf_s(dim, L"%ld × %ld", g_cur->src.cx, g_cur->src.cy);
