@@ -10,15 +10,25 @@ It's a single 200 KB exe with no installer and nothing extra to install. While i
 
 ## Use
 
-Run `build\HoverPreview.exe`. An icon appears in the system tray. Right-click it for options:
+Run `build\HoverPreview.exe`. It runs in the background with no tray icon and opens its settings window. Close the window and previews keep working.
 
-| Option | What it does |
+To get back to the settings later, either:
+
+- run HoverPreview again (Start menu, desktop shortcut or the exe). The running copy opens its settings instead of starting a second copy, or
+- right-click empty space in a folder or on the desktop → **Show more options** → **HoverPreview settings**.
+
+| Setting | What it does |
 | --- | --- |
-| Previews on | Pause/resume (or double-click the tray icon) |
-| Hover delay | How long the mouse must rest before a preview opens (0.15 / 0.3 / 0.7 s) |
+| Previews | Pause/resume previews |
+| Hover delay | How long the mouse must rest before a preview opens: Fast 0.15 s, Normal 0.3 s, Relaxed 0.7 s |
 | Preview size | Small, Medium, Large |
 | Play sound in videos | Turn off to preview videos muted |
-| Start with Windows | Launch automatically at sign-in |
+| Start with Windows | Starts silently at sign-in (`--background`) |
+| Explorer right-click menu | Adds or removes the "HoverPreview settings" menu entry |
+
+**Quit HoverPreview** in the settings window stops it completely.
+
+The Explorer entry sits under "Show more options" because Windows 11's short menu only accepts apps installed as signed packages. Everything is stored under your user account (`HKCU`), so no admin rights are needed.
 
 Previews close when the mouse leaves the file, when you click, or when you press Esc. After one preview closes, the next opens almost instantly, so you can glide across a folder.
 

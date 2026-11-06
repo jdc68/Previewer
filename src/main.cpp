@@ -22,7 +22,14 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cwchar>
+#include <objidl.h>
+namespace Gdiplus {
+using std::max;
+using std::min;
+}
+#include <gdiplus.h>
 
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -39,10 +46,8 @@ using Microsoft::WRL::ComPtr;
 
 #define WM_APP_SHOW (WM_APP + 1)
 #define WM_APP_HIDE (WM_APP + 2)
-#define WM_APP_TRAY (WM_APP + 3)
+#define WM_APP_SETTINGS (WM_APP + 3)
 
-enum { ID_ENABLED = 100, ID_DELAY_FAST, ID_DELAY_NORMAL, ID_DELAY_SLOW, ID_SIZE_S, ID_SIZE_M, ID_SIZE_L,
-       ID_SOUND, ID_AUTOSTART, ID_EXIT };
 enum { T_ANIM = 1, T_PROGRESS = 2, T_TRIM = 3 };
 
 static const COLORREF kBg = RGB(32, 32, 32);
@@ -121,7 +126,7 @@ static void SetAutostart(bool on)
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
         return;
     if (on) {
-        std::wstring v = L"\"" + ExePath() + L"\"";
+        std::wstring v = L"\"" + ExePath() + L"\" --background";
         RegSetValueExW(k, kAppName, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
     } else {
         RegDeleteValueW(k, kAppName);
@@ -1031,8 +1036,6 @@ static LONGLONG g_duration = 0;
 static std::wstring g_error;
 static int g_fontDpi = 0;
 static HFONT g_fName = nullptr, g_fInfo = nullptr, g_fIcon = nullptr;
-static HICON g_trayIcon = nullptr;
-static UINT g_msgTaskbarCreated = 0;
 
 static int S(int v) { return MulDiv(v, g_cur ? g_cur->dpi : 96, 96); }
 
@@ -1489,104 +1492,440 @@ static LRESULT CALLBACK VideoProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tray icon and menu
+// Explorer right-click menu entry (under "Show more options" on Windows 11)
 // ---------------------------------------------------------------------------------------------
 
-static void TrayIcon(DWORD action, bool welcome)
+static const wchar_t* const kMenuKeys[] = {
+    L"Software\\Classes\\Directory\\Background\\shell\\HoverPreview",
+    L"Software\\Classes\\DesktopBackground\\shell\\HoverPreview" };
+
+static void SetRegString(const std::wstring& key, const wchar_t* name, const std::wstring& v)
 {
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_main;
-    nid.uID = 1;
-    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = g_trayIcon;
-    wcscpy_s(nid.szTip, g_enabled ? L"HoverPreview" : L"HoverPreview (paused)");
-    if (welcome) {
-        nid.uFlags |= NIF_INFO;
-        wcscpy_s(nid.szInfoTitle, L"HoverPreview is running");
-        wcscpy_s(nid.szInfo, L"Rest the mouse on a photo, video or song in File Explorer to preview it. "
-                             L"Right-click this icon for options.");
-        nid.dwInfoFlags = NIIF_INFO;
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) ==
+        ERROR_SUCCESS) {
+        RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
     }
-    Shell_NotifyIconW(action, &nid);
 }
 
-static void ShowTrayMenu()
+static bool ExplorerMenuEnabled()
 {
-    auto chk = [](bool b) { return (UINT)(MF_STRING | (b ? MF_CHECKED : MF_UNCHECKED)); };
-    HMENU m = CreatePopupMenu();
-    HMENU md = CreatePopupMenu();
-    HMENU ms = CreatePopupMenu();
-    int d = g_delayMs, s = g_maxSize;
-    AppendMenuW(md, chk(d == kDelays[0]), ID_DELAY_FAST, L"Fast (0.15 s)");
-    AppendMenuW(md, chk(d == kDelays[1]), ID_DELAY_NORMAL, L"Normal (0.3 s)");
-    AppendMenuW(md, chk(d == kDelays[2]), ID_DELAY_SLOW, L"Relaxed (0.7 s)");
-    AppendMenuW(ms, chk(s == kSizes[0]), ID_SIZE_S, L"Small");
-    AppendMenuW(ms, chk(s == kSizes[1]), ID_SIZE_M, L"Medium");
-    AppendMenuW(ms, chk(s == kSizes[2]), ID_SIZE_L, L"Large");
-
-    AppendMenuW(m, chk(g_enabled), ID_ENABLED, L"Previews on\tDouble-click icon");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)md, L"Hover delay");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ms, L"Preview size");
-    AppendMenuW(m, chk(g_videoSound), ID_SOUND, L"Play sound in videos");
-    AppendMenuW(m, chk(AutostartEnabled()), ID_AUTOSTART, L"Start with Windows");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
-
-    POINT pt;
-    GetCursorPos(&pt);
-    SetForegroundWindow(g_main);
-    TrackPopupMenuEx(m, TPM_RIGHTBUTTON | TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, g_main, nullptr);
-    PostMessageW(g_main, WM_NULL, 0, 0);
-    DestroyMenu(m);
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kMenuKeys[0], 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    RegCloseKey(k);
+    return true;
 }
 
-static void OnCommand(int id)
+static void SetExplorerMenu(bool on)
+{
+    std::wstring exe = ExePath();
+    for (auto key : kMenuKeys) {
+        if (on) {
+            SetRegString(key, nullptr, L"HoverPreview settings");
+            SetRegString(key, L"Icon", exe + L",0");
+            SetRegString(std::wstring(key) + L"\\command", nullptr, L"\"" + exe + L"\"");
+        } else {
+            RegDeleteTreeW(HKEY_CURRENT_USER, key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings window (opened by running HoverPreview again, or from Explorer's right-click menu)
+// ---------------------------------------------------------------------------------------------
+
+enum { SI_NONE = -1, SI_ENABLED, SI_DELAY0, SI_DELAY1, SI_DELAY2, SI_SIZE0, SI_SIZE1, SI_SIZE2, SI_SOUND,
+       SI_AUTOSTART, SI_MENU, SI_QUIT, SI_CLOSE };
+
+struct SetHit {
+    RECT r;
+    int id;
+};
+
+struct SetRow {
+    const wchar_t* label;
+    const wchar_t* sub;
+    int id;
+    const wchar_t* const* segments;
+};
+
+static const wchar_t* const kDelayNames[] = { L"Fast", L"Normal", L"Relaxed" };
+static const wchar_t* const kSizeNames[] = { L"Small", L"Medium", L"Large" };
+static const SetRow kRows[] = {
+    { L"Previews", L"Show a preview when the mouse rests on a file", SI_ENABLED, nullptr },
+    { L"Hover delay", nullptr, SI_DELAY0, kDelayNames },
+    { L"Preview size", nullptr, SI_SIZE0, kSizeNames },
+    { L"Play sound in videos", nullptr, SI_SOUND, nullptr },
+    { L"Start with Windows", L"Runs quietly in the background", SI_AUTOSTART, nullptr },
+    { L"Explorer right-click menu", L"Listed under “Show more options”", SI_MENU, nullptr },
+};
+
+static const int kSetW = 460, kSetH = 580;
+static const COLORREF kWinBg = RGB(32, 32, 32);
+static const COLORREF kCard = RGB(43, 43, 43);
+static const COLORREF kCardHover = RGB(52, 52, 52);
+static const COLORREF kOnAccent = RGB(16, 16, 16);
+
+static HWND g_settings = nullptr;
+static std::vector<SetHit> g_setHits;
+static int g_setHover = SI_NONE, g_setPressed = SI_NONE;
+static int g_setDpi = 96, g_setFontDpi = 0;
+static HFONT g_sfTitle = nullptr, g_sfLabel = nullptr, g_sfSub = nullptr, g_sfBtn = nullptr;
+static HICON g_setIcon = nullptr;
+static ULONG_PTR g_gdiplus = 0;
+
+static int SS(int v) { return MulDiv(v, g_setDpi, 96); }
+
+static void SettingsResources()
+{
+    if (g_setFontDpi == g_setDpi)
+        return;
+    for (HFONT f : { g_sfTitle, g_sfLabel, g_sfSub, g_sfBtn })
+        if (f) DeleteObject(f);
+    if (g_setIcon) DestroyIcon(g_setIcon);
+    auto font = [](int px, int weight) {
+        return CreateFontW(-SS(px), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                           L"Segoe UI");
+    };
+    g_sfTitle = font(20, FW_SEMIBOLD);
+    g_sfLabel = font(14, FW_NORMAL);
+    g_sfSub = font(12, FW_NORMAL);
+    g_sfBtn = font(13, FW_SEMIBOLD);
+    g_setIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, SS(32), SS(32), 0);
+    g_setFontDpi = g_setDpi;
+}
+
+static bool ToggleOn(int id)
 {
     switch (id) {
-    case ID_ENABLED:
-        g_enabled = !g_enabled;
-        TrayIcon(NIM_MODIFY, false);
-        break;
-    case ID_DELAY_FAST: g_delayMs = kDelays[0]; break;
-    case ID_DELAY_NORMAL: g_delayMs = kDelays[1]; break;
-    case ID_DELAY_SLOW: g_delayMs = kDelays[2]; break;
-    case ID_SIZE_S: g_maxSize = kSizes[0]; break;
-    case ID_SIZE_M: g_maxSize = kSizes[1]; break;
-    case ID_SIZE_L: g_maxSize = kSizes[2]; break;
-    case ID_SOUND:
+    case SI_ENABLED: return g_enabled;
+    case SI_SOUND: return g_videoSound;
+    case SI_AUTOSTART: return AutostartEnabled();
+    case SI_MENU: return ExplorerMenuEnabled();
+    }
+    return false;
+}
+
+static int SelectedSegment(int firstId)
+{
+    const int* values = firstId == SI_DELAY0 ? kDelays : kSizes;
+    int v = firstId == SI_DELAY0 ? g_delayMs.load() : g_maxSize.load();
+    for (int i = 0; i < 3; i++)
+        if (values[i] == v) return i;
+    return -1;
+}
+
+static Gdiplus::Color GpColor(COLORREF c) { return Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)); }
+
+static void FillRound(Gdiplus::Graphics* g, const RECT& r, float radius, COLORREF fill, COLORREF border = CLR_INVALID)
+{
+    float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left), h = (float)(r.bottom - r.top);
+    float d = std::min({ radius * 2, w, h });
+    Gdiplus::GraphicsPath p;
+    p.AddArc(x, y, d, d, 180, 90);
+    p.AddArc(x + w - d, y, d, d, 270, 90);
+    p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    p.AddArc(x, y + h - d, d, d, 90, 90);
+    p.CloseFigure();
+    if (fill != CLR_INVALID) {
+        Gdiplus::SolidBrush b(GpColor(fill));
+        g->FillPath(&b, &p);
+    }
+    if (border != CLR_INVALID) {
+        Gdiplus::Pen pen(GpColor(border), (float)std::max(1, SS(1)));
+        g->DrawPath(&pen, &p);
+    }
+}
+
+static void TextIn(HDC dc, const wchar_t* s, RECT r, HFONT f, COLORREF c, UINT flags)
+{
+    SelectObject(dc, f);
+    SetTextColor(dc, c);
+    DrawTextW(dc, s, -1, &r, flags | DT_NOPREFIX);
+}
+
+// Called twice per paint: first with g (shapes), then without (text), so GDI+ and ClearType text don't mix.
+static void DrawSettings(HDC dc, Gdiplus::Graphics* g)
+{
+    int W = SS(kSetW), H = SS(kSetH), pad = SS(20);
+    if (g)
+        g_setHits.clear();
+
+    if (!g) {
+        DrawIconEx(dc, pad, SS(24), g_setIcon, SS(32), SS(32), 0, nullptr, DI_NORMAL);
+        TextIn(dc, L"HoverPreview", { SS(64), SS(16), W - pad, SS(44) }, g_sfTitle, kText,
+               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        TextIn(dc, L"Rest the mouse on a photo, video or song in File Explorer or on the desktop to preview it.",
+               { SS(64), SS(46), W - pad, SS(88) }, g_sfSub, kSub, DT_LEFT | DT_WORDBREAK);
+    }
+
+    int y = SS(100), rowH = SS(56), gap = SS(4);
+    for (const SetRow& row : kRows) {
+        RECT rr = { pad, y, W - pad, y + rowH };
+        int mid = (rr.top + rr.bottom) / 2;
+        int right = rr.right - SS(16);
+        int labelRight = right;
+
+        if (row.segments) {
+            int sw = SS(76), sh = SS(30);
+            RECT box = { right - 3 * sw, mid - sh / 2, right, mid + sh / 2 };
+            labelRight = box.left - SS(12);
+            int sel = SelectedSegment(row.id);
+            if (g) {
+                FillRound(g, rr, (float)SS(6), kCard);
+                FillRound(g, box, (float)SS(5), kTile);
+            }
+            for (int i = 0; i < 3; i++) {
+                RECT seg = { box.left + i * sw, box.top, box.left + (i + 1) * sw, box.bottom };
+                RECT inner = { seg.left + SS(2), seg.top + SS(2), seg.right - SS(2), seg.bottom - SS(2) };
+                if (g) {
+                    if (i == sel) FillRound(g, inner, (float)SS(4), kAccent);
+                    else if (g_setHover == row.id + i) FillRound(g, inner, (float)SS(4), RGB(66, 66, 66));
+                    g_setHits.push_back({ seg, row.id + i });
+                } else {
+                    TextIn(dc, row.segments[i], inner, g_sfSub, i == sel ? kOnAccent : kText,
+                           DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                }
+            }
+        } else {
+            bool on = ToggleOn(row.id);
+            int tw = SS(40), th = SS(20);
+            RECT tr = { right - tw, mid - th / 2, right, mid + th / 2 };
+            labelRight = tr.left - SS(50);
+            if (g) {
+                FillRound(g, rr, (float)SS(6), g_setHover == row.id ? kCardHover : kCard);
+                bool hot = g_setHover == row.id;
+                float d = (float)(hot ? SS(14) : SS(12));
+                float ky = mid - d / 2;
+                if (on) {
+                    FillRound(g, tr, th / 2.0f, kAccent);
+                    Gdiplus::SolidBrush kb(GpColor(kOnAccent));
+                    g->FillEllipse(&kb, tr.right - SS(4) - d, ky, d, d);
+                } else {
+                    FillRound(g, tr, th / 2.0f, CLR_INVALID, kSub);
+                    Gdiplus::SolidBrush kb(GpColor(kSub));
+                    g->FillEllipse(&kb, (float)(tr.left + SS(4)), ky, d, d);
+                }
+                g_setHits.push_back({ rr, row.id });
+            } else {
+                TextIn(dc, on ? L"On" : L"Off", { tr.left - SS(46), rr.top, tr.left - SS(10), rr.bottom }, g_sfSub,
+                       kText, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            }
+        }
+
+        if (!g) {
+            RECT lr = { rr.left + SS(16), rr.top, labelRight, rr.bottom };
+            if (row.sub) {
+                TextIn(dc, row.label, { lr.left, rr.top + SS(8), lr.right, mid + SS(1) }, g_sfLabel, kText,
+                       DT_LEFT | DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS);
+                TextIn(dc, row.sub, { lr.left, mid + SS(2), lr.right, rr.bottom - SS(6) }, g_sfSub, kSub,
+                       DT_LEFT | DT_SINGLELINE | DT_TOP | DT_END_ELLIPSIS);
+            } else {
+                TextIn(dc, row.label, lr, g_sfLabel, kText, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+        }
+        y += rowH + gap;
+    }
+
+    if (!g) {
+        TextIn(dc,
+               L"To open this window again, run HoverPreview, or right-click empty space in a folder "
+               L"› Show more options › HoverPreview settings.",
+               { pad, y + SS(10), W - pad, H - SS(64) }, g_sfSub, kSub, DT_LEFT | DT_WORDBREAK);
+    }
+
+    int bh = SS(32), by = H - pad - bh;
+    RECT quit = { pad, by, pad + SS(150), by + bh };
+    RECT close = { W - pad - SS(100), by, W - pad, by + bh };
+    if (g) {
+        FillRound(g, quit, (float)SS(5), g_setHover == SI_QUIT ? RGB(66, 66, 66) : kTile);
+        FillRound(g, close, (float)SS(5), g_setHover == SI_CLOSE ? RGB(120, 212, 255) : kAccent);
+        g_setHits.push_back({ quit, SI_QUIT });
+        g_setHits.push_back({ close, SI_CLOSE });
+    } else {
+        TextIn(dc, L"Quit HoverPreview", quit, g_sfBtn, RGB(255, 153, 164), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        TextIn(dc, L"Close", close, g_sfBtn, kOnAccent, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+}
+
+static void PaintSettings(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, std::max<LONG>(1, rc.right), std::max<LONG>(1, rc.bottom));
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    FillRectColor(mem, rc, kWinBg);
+    {
+        Gdiplus::Graphics g(mem);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        DrawSettings(mem, &g);
+    }
+    SetBkMode(mem, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(mem, g_sfLabel);
+    DrawSettings(mem, nullptr);
+    BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldFont);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+static int SettingsHitTest(POINT pt)
+{
+    for (const SetHit& h : g_setHits)
+        if (PtInRect(&h.r, pt)) return h.id;
+    return SI_NONE;
+}
+
+static void SettingsClick(int id)
+{
+    switch (id) {
+    case SI_ENABLED: g_enabled = !g_enabled; break;
+    case SI_DELAY0: case SI_DELAY1: case SI_DELAY2: g_delayMs = kDelays[id - SI_DELAY0]; break;
+    case SI_SIZE0: case SI_SIZE1: case SI_SIZE2: g_maxSize = kSizes[id - SI_SIZE0]; break;
+    case SI_SOUND:
         g_videoSound = !g_videoSound;
         if (g_player && g_hasVideo)
             g_player->SetMute(g_videoSound ? FALSE : TRUE);
         break;
-    case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
-    case ID_EXIT: DestroyWindow(g_main); return;
+    case SI_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
+    case SI_MENU: SetExplorerMenu(!ExplorerMenuEnabled()); break;
+    case SI_QUIT:
+        DestroyWindow(g_settings);
+        DestroyWindow(g_main);
+        return;
+    case SI_CLOSE:
+        DestroyWindow(g_settings);
+        return;
+    default: return;
     }
     SaveSettings();
+    InvalidateRect(g_settings, nullptr, FALSE);
 }
+
+static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: PaintSettings(hwnd); return 0;
+    case WM_MOUSEMOVE: {
+        int h = SettingsHitTest({ (short)LOWORD(lp), (short)HIWORD(lp) });
+        if (h != g_setHover) {
+            g_setHover = h;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&t);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_setHover = SI_NONE;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT && g_setHover != SI_NONE) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        g_setPressed = SettingsHitTest({ (short)LOWORD(lp), (short)HIWORD(lp) });
+        SetCapture(hwnd);
+        return 0;
+    case WM_LBUTTONUP: {
+        ReleaseCapture();
+        int h = SettingsHitTest({ (short)LOWORD(lp), (short)HIWORD(lp) });
+        int pressed = g_setPressed;
+        g_setPressed = SI_NONE;
+        if (h != SI_NONE && h == pressed)
+            SettingsClick(h);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_DPICHANGED: {
+        g_setDpi = HIWORD(wp);
+        SettingsResources();
+        const RECT* r = (const RECT*)lp;
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_DESTROY:
+        g_settings = nullptr;
+        g_setHits.clear();
+        g_setHover = g_setPressed = SI_NONE;
+        if (IsWindow(g_main))
+            SetTimer(g_main, T_TRIM, 5000, nullptr);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowSettings()
+{
+    if (g_settings) {
+        if (IsIconic(g_settings))
+            ShowWindow(g_settings, SW_RESTORE);
+        SetForegroundWindow(g_settings);
+        return;
+    }
+    if (!g_gdiplus) {
+        Gdiplus::GdiplusStartupInput in;
+        Gdiplus::GdiplusStartup(&g_gdiplus, &in, nullptr);
+    }
+    POINT pt;
+    GetCursorPos(&pt);
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(mon, &mi);
+    UINT dx = 96, dy = 96;
+    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
+    g_setDpi = (int)dx;
+    SettingsResources();
+
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = { 0, 0, SS(kSetW), SS(kSetH) };
+    AdjustWindowRectExForDpi(&r, style, FALSE, 0, g_setDpi);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    const RECT& wa = mi.rcWork;
+    int x = wa.left + (wa.right - wa.left - w) / 2, y = wa.top + (wa.bottom - wa.top - h) / 2;
+    g_settings = CreateWindowExW(0, L"HoverPreviewSettings", L"HoverPreview settings", style, x, y, w, h, nullptr,
+                                 nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!g_settings)
+        return;
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(g_settings, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    ShowWindow(g_settings, SW_SHOW);
+    SetForegroundWindow(g_settings);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Main hidden window and startup
+// ---------------------------------------------------------------------------------------------
 
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == g_msgTaskbarCreated && msg != 0) {
-        TrayIcon(NIM_ADD, false);
-        return 0;
-    }
     switch (msg) {
     case WM_APP_SHOW: ShowPreview((Preview*)lp); return 0;
     case WM_APP_HIDE: HidePreview(); return 0;
-    case WM_APP_TRAY:
-        if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
-            ShowTrayMenu();
-        else if (LOWORD(lp) == WM_LBUTTONDBLCLK)
-            OnCommand(ID_ENABLED);
-        return 0;
-    case WM_COMMAND: OnCommand(LOWORD(wp)); return 0;
+    case WM_APP_SETTINGS: ShowSettings(); return 0;
     case WM_TIMER:
         if (wp == T_TRIM) {
             KillTimer(hwnd, T_TRIM);
-            if (!g_cur)   // give memory back after media playback
+            if (!g_cur)   // give memory back after media playback / closing settings
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         }
         return 0;
@@ -1600,6 +1939,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
 {
     g_log = cmd && wcsstr(cmd, L"--log");
+    bool background = cmd && wcsstr(cmd, L"--background");
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i + 1 < argc; i++)
@@ -1611,8 +1951,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
 
     HANDLE mutex = test ? nullptr : CreateMutexW(nullptr, TRUE, L"Local\\HoverPreview.Instance");
     if (!test && GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"HoverPreview is already running.\nLook for its icon in the system tray.", kAppName,
-                    MB_ICONINFORMATION);
+        // Already running: ask that instance to open its settings window.
+        if (!background) {
+            HWND w = nullptr;
+            for (int i = 0; i < 30 && !(w = FindWindowW(L"HoverPreviewMain", nullptr)); i++)
+                Sleep(100);
+            if (w) {
+                DWORD pid = 0;
+                GetWindowThreadProcessId(w, &pid);
+                AllowSetForegroundWindow(pid);
+                PostMessageW(w, WM_APP_SETTINGS, 0, 0);
+            }
+        }
+        if (mutex)
+            CloseHandle(mutex);
         return 0;
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1638,6 +1990,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
 
+    wc.lpfnWndProc = SettingsProc;
+    wc.lpszClassName = L"HoverPreviewSettings";
+    wc.hbrBackground = nullptr;
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                 GetSystemMetrics(SM_CYICON), 0);
+    wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                   GetSystemMetrics(SM_CYSMICON), 0);
+    RegisterClassExW(&wc);
+
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, L"HoverPreviewMain", kAppName, WS_POPUP, 0, 0, 0, 0, nullptr,
                              nullptr, hInst, nullptr);
     g_popup = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"HoverPreviewPopup", kAppName,
@@ -1653,20 +2014,25 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
     COLORREF border = RGB(64, 64, 64);
     DwmSetWindowAttribute(g_popup, 34, &border, sizeof(border));
 
-    g_trayIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
-                                   GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     g_quit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE worker = nullptr;
     if (test) {
         worker = CreateThread(nullptr, 0, TestThread, nullptr, 0, nullptr);
         SetTimer(nullptr, 0, 5000, [](HWND, UINT, UINT_PTR, DWORD) { DestroyWindow(g_main); });
     } else {
-        g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-        bool firstRun = RegReadDword(L"Welcomed", 0) == 0;
-        TrayIcon(NIM_ADD, firstRun);
-        if (firstRun)
-            RegWriteDword(L"Welcomed", 1);
+        // First run of this version: add the Explorer menu entry. Afterwards keep the stored
+        // paths pointing at this exe in case it was moved.
+        if (RegReadDword(L"MenuSetup", 0) == 0) {
+            SetExplorerMenu(true);
+            RegWriteDword(L"MenuSetup", 1);
+        } else if (ExplorerMenuEnabled()) {
+            SetExplorerMenu(true);
+        }
+        if (AutostartEnabled())
+            SetAutostart(true);
         worker = CreateThread(nullptr, 0, DetectorThread, nullptr, 0, nullptr);
+        if (!background)
+            PostMessageW(g_main, WM_APP_SETTINGS, 0, 0);
     }
 
     MSG msg;
@@ -1680,12 +2046,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
         WaitForSingleObject(worker, 3000);
         CloseHandle(worker);
     }
-    // Drop previews the detector posted but nobody consumed.
-    while (PeekMessageW(&msg, g_main, WM_APP_SHOW, WM_APP_SHOW, PM_REMOVE))
-        delete (Preview*)msg.lParam;
     HidePreview();
-    if (!test)
-        TrayIcon(NIM_DELETE, false);
+    if (g_gdiplus)
+        Gdiplus::GdiplusShutdown(g_gdiplus);
     CoUninitialize();
     if (mutex)
         CloseHandle(mutex);
