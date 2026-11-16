@@ -427,6 +427,7 @@ static HANDLE g_quit = nullptr;
 
 struct HitItem {
     std::wstring name;
+    std::wstring path;             // Explorer+ items carry their full path
     RECT rect{};
     HWND hwnd = nullptr;
     HWND root = nullptr;
@@ -723,6 +724,33 @@ bool Detector::DecodeGif(IWICBitmapDecoder* dec, UINT count, Preview* p)
     return true;
 }
 
+// Explorer+ (a WPF file manager) is recognised by its exe name. Its file list items expose the
+// file's full path as their UI Automation id, so no folder lookup is needed there.
+static bool IsExplorerPlus(HWND root)
+{
+    static DWORD lastPid = 0;
+    static bool lastResult = false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(root, &pid);
+    if (!pid)
+        return false;
+    if (pid == lastPid)
+        return lastResult;
+    bool result = false;
+    if (HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t buf[MAX_PATH * 2];
+        DWORD len = ARRAYSIZE(buf);
+        if (QueryFullProcessImageNameW(proc, 0, buf, &len)) {
+            const wchar_t* exe = wcsrchr(buf, L'\\');
+            result = _wcsicmp(exe ? exe + 1 : buf, L"ExplorerPlus.exe") == 0;
+        }
+        CloseHandle(proc);
+    }
+    lastPid = pid;
+    lastResult = result;
+    return result;
+}
+
 bool Detector::HitTest(POINT pt, HitItem& out)
 {
     HWND h = WindowFromPoint(pt);
@@ -731,7 +759,11 @@ bool Detector::HitTest(POINT pt, HitItem& out)
     HWND root = GetAncestor(h, GA_ROOT);
     bool desktop = ClassIs(h, L"SysListView32") && (ClassIs(root, L"Progman") || ClassIs(root, L"WorkerW"));
     bool explorer = ClassIs(h, L"DirectUIHWND") && ClassIs(root, L"CabinetWClass");
-    if (!desktop && !explorer)
+    bool plus = !desktop && !explorer && IsExplorerPlus(root);
+    if (!desktop && !explorer && !plus)
+        return false;
+    // Explorer+ marks its windows while its own hover preview is on
+    if (plus && GetPropW(root, L"ExplorerPlus.HoverPreview"))
         return false;
     if (!uia_)
         return false;
@@ -739,18 +771,38 @@ bool Detector::HitTest(POINT pt, HitItem& out)
     ComPtr<IUIAutomationElement> el;
     if (FAILED(uia_->ElementFromPoint(pt, &el)) || !el)
         return false;
+    // WPF reports a details-view row as DataItem, and the hovered text sits a few levels below it.
+    auto isItem = [plus](CONTROLTYPEID t) {
+        return t == UIA_ListItemControlTypeId || (plus && t == UIA_DataItemControlTypeId);
+    };
     CONTROLTYPEID ct = 0;
-    for (int i = 0; i < 4 && el; i++) {
+    for (int i = 0; i < (plus ? 8 : 4) && el; i++) {
         el->get_CurrentControlType(&ct);
-        if (ct == UIA_ListItemControlTypeId)
+        if (isItem(ct))
             break;
         ComPtr<IUIAutomationElement> parent;
         if (FAILED(walker_->GetParentElement(el.Get(), &parent)))
             parent.Reset();
         el = parent;
     }
-    if (!el || ct != UIA_ListItemControlTypeId)
+    if (!el || !isItem(ct))
         return false;
+
+    if (plus) {
+        BSTR id = nullptr;
+        if (FAILED(el->get_CurrentAutomationId(&id)) || !id)
+            return false;
+        out.path.assign(id, SysStringLen(id));
+        SysFreeString(id);
+        // Only real file-system items carry a path; tabs, menus and virtual items don't.
+        if (out.path.size() < 3 || (out.path[1] != L':' && out.path.compare(0, 2, L"\\\\") != 0))
+            return false;
+        out.name = out.path;
+        el->get_CurrentBoundingRectangle(&out.rect);
+        out.hwnd = h;
+        out.root = root;
+        return true;
+    }
 
     BSTR name = nullptr;
     if (FAILED(el->get_CurrentName(&name)) || !name)
@@ -892,6 +944,13 @@ static bool ResolveInView(IFolderView* fv, const std::wstring& name, std::wstrin
 
 bool Detector::ResolvePath(const HitItem& hit, std::wstring& path)
 {
+    if (!hit.path.empty()) {
+        DWORD a = GetFileAttributesW(hit.path.c_str());
+        if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY) || KindOf(hit.path) == Kind::None)
+            return false;
+        path = hit.path;
+        return true;
+    }
     if (hit.desktop) {
         const KNOWNFOLDERID* ids[] = { &FOLDERID_Desktop, &FOLDERID_PublicDesktop };
         for (auto id : ids) {
@@ -1025,12 +1084,21 @@ static bool CursorOverPopup(POINT pt)
     return h && GetAncestor(h, GA_ROOT) == g_popup;
 }
 
+// Safe to call again: only creates what is still missing. Right after sign-in the system
+// services we depend on may not be ready yet, so the detector keeps retrying until they are.
 void Detector::Init()
 {
-    CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia_));
-    if (uia_)
-        uia_->get_RawViewWalker(&walker_);
-    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
+    if (!uia_ || !walker_) {
+        uia_.Reset();
+        walker_.Reset();
+        if (SUCCEEDED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia_))) &&
+            uia_ && FAILED(uia_->get_RawViewWalker(&walker_))) {
+            uia_.Reset();
+            walker_.Reset();
+        }
+    }
+    if (!wic_)
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
 }
 
 void Detector::Run()
@@ -1039,7 +1107,7 @@ void Detector::Run()
     Init();
 
     POINT last{ LONG_MIN, LONG_MIN };
-    ULONGLONG stillSince = 0, lastRecheck = 0, hiddenAt = 0;
+    ULONGLONG stillSince = 0, lastRecheck = 0, hiddenAt = 0, lastInit = 0;
     bool checked = false, shown = false;
     RECT shownRect{};
     std::wstring shownName;
@@ -1063,6 +1131,11 @@ void Detector::Run()
         }
 
         ULONGLONG now = GetTickCount64();
+        if ((!uia_ || !walker_ || !wic_) && now - lastInit >= 2000) {
+            lastInit = now;
+            Init();
+            Log(L"init retry: uia=%d wic=%d", uia_ && walker_ ? 1 : 0, wic_ ? 1 : 0);
+        }
         POINT pt;
         if (!GetCursorPos(&pt))
             continue;
@@ -2221,8 +2294,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int)
         } else if (ExplorerMenuEnabled()) {
             SetExplorerMenu(true);
         }
-        if (AutostartEnabled())
+        // Start with Windows is on by default; after that the settings toggle decides.
+        if (RegReadDword(L"AutostartSetup", 0) == 0) {
             SetAutostart(true);
+            RegWriteDword(L"AutostartSetup", 1);
+        } else if (AutostartEnabled()) {
+            SetAutostart(true);
+        }
         worker = CreateThread(nullptr, 0, DetectorThread, nullptr, 0, nullptr);
         if (!background)
             PostMessageW(g_main, WM_APP_SETTINGS, 0, 0);

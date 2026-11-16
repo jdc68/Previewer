@@ -1,6 +1,6 @@
 # HoverPreview
 
-Rest your mouse on a photo, video, song or text file in File Explorer (or on the desktop) and a preview pops up next to the cursor, no clicking needed. Move away and it's gone.
+Rest your mouse on a photo, video, song or text file in File Explorer, Explorer+ or on the desktop and a preview pops up next to the cursor, no clicking needed. Move away and it's gone.
 
 - **Photos** are shown scaled to fit, rotated correctly from camera EXIF data, with transparency on a checkerboard. Animated GIFs play.
 - **Videos** play right away in the popup and loop, with a progress bar.
@@ -58,8 +58,10 @@ Output: `build\HoverPreview.exe`.
 
 ## How it works
 
-- A background thread checks the cursor position every 50 ms (a few microseconds of work each time). It does real work only once the mouse rests over an Explorer file list or the desktop.
+- A background thread checks the cursor position every 50 ms (a few microseconds of work each time). It does real work only once the mouse rests over an Explorer or Explorer+ file list or the desktop.
 - UI Automation tells it which item is under the cursor. The Explorer tab's folder comes from the Shell's window list, which also covers search results and libraries.
+- Explorer+ has its own hover preview. While that's on, Explorer+ marks its windows with the `ExplorerPlus.HoverPreview` window property and HoverPreview leaves them alone, so there are never two popups.
+- Explorer+ windows are recognised by their process (`ExplorerPlus.exe`). Its file list items carry the file's full path as their UI Automation id, so no folder lookup is needed. Items without a file path (virtual folders) are skipped.
 - Images are decoded with WIC. JPEGs are decoded directly at reduced size, so a 24 MP photo takes about 30 ms.
 - Video and audio use Media Foundation (the engine Windows uses for its own player). The player is created per preview and destroyed afterwards, and memory is handed back to Windows a few seconds later.
 
